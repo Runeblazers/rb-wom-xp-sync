@@ -29,152 +29,176 @@ import urllib.parse
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
+import gspread
 import requests
+from gspread.exceptions import APIError
 
-log = logging.getLogger("xp-sync")
+__version__ = "1.1.0"
 
-WOM_BASE = os.environ.get("WOM_BASE", "https://api.wiseoldman.net/v2")
-ROSTER_TAB = os.environ.get("ROSTER_TAB", "Roster")
+ROSTER_TAB = "Roster"
+FIRST_ROW, LAST_ROW = 7, 56
 HEADER_ROW = 5
-FIRST_ROW = 7
-LAST_ROW = 56
-USER_COL = 1  # A
-UPDATED_COL = 2  # B
-STATUS_COL = 3  # C
-CURRENT_FIRST_COL = 4  # D
-HEARTBEAT = Path(os.environ.get("HEARTBEAT_FILE", "/tmp/xp-sync-heartbeat"))
-SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
-EXCEL_EPOCH = dt.datetime(1899, 12, 30)
-
-
-# ---------------------------------------------------------------- helpers
-def col_letter(n: int) -> str:
-    s = ""
-    while n:
-        n, r = divmod(n - 1, 26)
-        s = chr(65 + r) + s
-    return s
-
-
-def sheet_serial(now_local: dt.datetime) -> float:
-    """Google Sheets datetime serial for a naive local datetime."""
-    delta = now_local.replace(tzinfo=None) - EXCEL_EPOCH
-    return delta.days + delta.seconds / 86400
+CURRENT_FIRST_COL = 4  # 'D' column
+HEARTBEAT = Path("/tmp/xp-sync-heartbeat")
+log = logging.getLogger("xp-sync")
 
 
 class WomError(Exception):
-    """Per-player failure; message becomes the status cell text."""
+    """Raised when a player query fails (404, rate limited, etc)."""
+    pass
 
 
-# ---------------------------------------------------------------- WOM client
 class Wom:
-    def __init__(self, api_key: str | None, user_agent: str, delay: float | None = None):
-        self.s = requests.Session()
-        self.s.headers["User-Agent"] = user_agent
-        if api_key:
-            self.s.headers["x-api-key"] = api_key
-        # Conservative spacing: ~100 req/min with a key, ~20 req/min without.
-        self.delay = delay if delay is not None else (0.7 if api_key else 3.2)
-        self._last = 0.0
-
+    """Wise Old Man API client with rate limiting."""
+    BASE = "https://api.wiseoldman.net/v2"
+    
+    def __init__(self, api_key: str | None, user_agent: str):
+        self.api_key = api_key
+        self.user_agent = user_agent
+        self.throttle = 0.7 if api_key else 3.2  # seconds per request
+        self.last_req = 0.0
+    
     def _throttle(self):
-        wait = self.delay - (time.monotonic() - self._last)
+        now = time.time()
+        wait = max(0, self.last_req + self.throttle - now)
         if wait > 0:
             time.sleep(wait)
-        self._last = time.monotonic()
-
-    def _request(self, method: str, url: str, retries: int = 3):
-        for attempt in range(retries + 1):
-            self._throttle()
-            try:
-                r = self.s.request(method, url, timeout=30)
-            except requests.RequestException as e:
-                if attempt == retries:
-                    raise WomError(f"network: {type(e).__name__}") from e
-                time.sleep(2 ** attempt)
-                continue
-            if r.status_code >= 500 and attempt < retries:
-                time.sleep(2 ** attempt)
-                continue
-            return r
-        raise WomError("unreachable")
-
-    def player(self, username: str) -> dict:
-        """Update-then-read a player. Falls back to a plain GET when the update
-        is on cooldown / rate limited, so we still get the latest stored snapshot."""
-        url = f"{WOM_BASE}/players/{urllib.parse.quote(username, safe='')}"
-        r = self._request("POST", url)
-        if r.status_code == 429:
-            r = self._request("GET", url)
-            if r.status_code == 429:
-                retry = float(r.headers.get("Retry-After", 20))
-                log.warning("rate limited; sleeping %.0fs", retry)
-                time.sleep(min(retry, 60))
-                r = self._request("GET", url)
-        if r.status_code == 404:
-            raise WomError("not found on WOM/hiscores")
-        if r.status_code == 400:
-            raise WomError("rejected (bad username?)")
-        if r.status_code in (401, 403):
-            raise WomError("auth error (check WOM key)")
-        if r.status_code == 429:
-            raise WomError("rate limited")
-        if not r.ok:
-            raise WomError(f"WOM HTTP {r.status_code}")
+        self.last_req = time.time()
+    
+    def _request(self, method: str, endpoint: str, **kw) -> dict:
+        """POST then GET on 429; raise WomError on failure."""
+        self._throttle()
+        url = f"{self.BASE}{endpoint}"
+        headers = {"User-Agent": self.user_agent}
+        if self.api_key:
+            headers["x-api-key"] = self.api_key
         try:
+            if method == "POST":
+                r = requests.post(url, headers=headers, timeout=5, **kw)
+                if r.status_code == 429:
+                    log.info("%s: rate limited on POST, trying GET", endpoint)
+                    self._throttle()
+                    r = requests.get(url, headers=headers, timeout=5)
+                r.raise_for_status()
+            else:
+                r = requests.get(url, headers=headers, timeout=5, **kw)
+                r.raise_for_status()
             return r.json()
-        except ValueError as e:
-            raise WomError("bad JSON") from e
+        except requests.exceptions.RequestException as e:
+            raise WomError(str(e)) from e
+    
+    def player(self, username: str) -> dict:
+        """GET /players/:username (with POST fallback for updates)."""
+        return self._request("POST", f"/players/{urllib.parse.quote(username)}")
+    
+    def snapshots(self, username: str, start_date: dt.datetime | None = None, end_date: dt.datetime | None = None) -> list[dict]:
+        """GET /players/:username/snapshots with optional date range."""
+        params = {}
+        if start_date:
+            params["startDate"] = start_date.isoformat()
+        if end_date:
+            params["endDate"] = end_date.isoformat()
+        return self._request("GET", f"/players/{urllib.parse.quote(username)}/snapshots", params=params).get("data", [])
 
 
-def extract_metrics(details: dict, keys: list[str]) -> list[int | None]:
-    """Pull one value per metric key: skill experience, else boss kills.
-    Unranked (-1) becomes 0. Missing metric becomes None (kept as 'unknown')."""
-    data = (details.get("latestSnapshot") or {}).get("data") or {}
-    skills = data.get("skills") or {}
-    bosses = data.get("bosses") or {}
-    out: list[int | None] = []
-    for k in keys:
-        if k in skills:
-            v = skills[k].get("experience")
-        elif k in bosses:
-            v = bosses[k].get("kills")
+def extract_metrics(player_data: dict, metric_keys: list[str]) -> list[int | None]:
+    """Extract XP/KC for given metric keys from player snapshot data.
+    
+    Returns list of values, with None for missing metrics.
+    Unranked (rank == -1) becomes 0 experience.
+    """
+    snapshot = player_data.get("latestSnapshot", {}).get("data", {})
+    skills = snapshot.get("skills", {})
+    bosses = snapshot.get("bosses", {})
+    
+    vals = []
+    for key in metric_keys:
+        if key in skills:
+            s = skills[key]
+            # Unranked (rank == -1) means 0 XP
+            val = 0 if s.get("rank", -1) == -1 else s.get("experience")
+        elif key in bosses:
+            val = bosses[key].get("kills")
         else:
-            v = None
-        out.append(None if v is None else max(0, int(v)))
-    return out
+            val = None
+        vals.append(val)
+    return vals
 
 
-# ---------------------------------------------------------------- sheet I/O
-def open_gspread(creds_path: str):
-    import gspread
-    from google.oauth2.service_account import Credentials
+def extract_metrics_from_snapshot(snapshot_data: dict, metric_keys: list[str]) -> list[int | None]:
+    """Extract XP/KC from a single snapshot object (date-stamped).
+    
+    Snapshot data has same structure as player.latestSnapshot.data.
+    """
+    skills = snapshot_data.get("skills", {})
+    bosses = snapshot_data.get("bosses", {})
+    
+    vals = []
+    for key in metric_keys:
+        if key in skills:
+            s = skills[key]
+            val = 0 if s.get("rank", -1) == -1 else s.get("experience")
+        elif key in bosses:
+            val = bosses[key].get("kills")
+        else:
+            val = None
+        vals.append(val)
+    return vals
 
-    creds = Credentials.from_service_account_file(creds_path, scopes=SCOPES)
-    return gspread.authorize(creds)
 
-
-def with_retry(fn, tries=4):
-    import gspread
-
-    for i in range(tries):
-        try:
-            return fn()
-        except gspread.exceptions.APIError as e:
-            code = getattr(getattr(e, "response", None), "status_code", 0)
-            if code in (429, 500, 502, 503) and i < tries - 1:
-                time.sleep(5 * (i + 1))
-                continue
-            raise
+def col_letter(col_num: int) -> str:
+    """Convert column number (1-indexed) to letter(s): 1='A', 27='AA'."""
+    s = ""
+    while col_num > 0:
+        col_num -= 1
+        s = chr(ord("A") + col_num % 26) + s
+        col_num //= 26
+    return s
 
 
 def pad(row: list, n: int) -> list:
-    row = list(row)[:n]
-    return row + [""] * (n - len(row))
+    """Pad row to length n with empty strings."""
+    return row + [""] * max(0, n - len(row))
 
 
-def sync_sheet(gc, sheet_id: str, wom: Wom, cache: dict, snapshot: str | None) -> dict:
-    """snapshot: None | 'missing' (fill blank baselines) | 'force' (overwrite all)."""
+def with_retry(fn, attempts: int = 3) -> any:
+    """Retry gspread API calls on transient errors."""
+    for i in range(attempts):
+        try:
+            return fn()
+        except APIError as e:
+            if i == attempts - 1 or "429" not in str(e):
+                raise
+            time.sleep(1 + i)
+
+
+def sheet_serial(dt_obj: dt.datetime) -> int:
+    """Convert datetime to Excel serial number (days since 1900-01-01)."""
+    epoch = dt.datetime(1899, 12, 30, tzinfo=dt.timezone.utc)
+    delta = dt_obj.replace(tzinfo=None) - epoch.replace(tzinfo=None)
+    return int(delta.days) + int(delta.seconds / 86400)
+
+
+def open_gspread(creds_path: str) -> gspread.Client:
+    """Open gspread client using service account JSON."""
+    return gspread.service_account(filename=creds_path)
+
+
+def alert(msg: str):
+    """Post alert to Discord webhook if configured."""
+    url = os.environ.get("DISCORD_WEBHOOK_URL")
+    if not url:
+        return
+    try:
+        requests.post(url, json={"content": f"⚠️ {msg}"}, timeout=5)
+    except Exception as e:
+        log.warning("discord alert failed: %s", e)
+
+
+def sync_sheet(gc, sheet_id: str, wom: Wom, cache: dict, snapshot: str | None, baseline_date: dt.datetime | None = None) -> dict:
+    """snapshot: None | 'missing' (fill blank baselines) | 'force' (overwrite all).
+    baseline_date: if provided, use snapshots from WOM at this date instead of current values.
+    """
     sh = with_retry(lambda: gc.open_by_key(sheet_id))
     ws = with_retry(lambda: sh.worksheet(ROSTER_TAB))
     tz = ZoneInfo(sh.fetch_sheet_metadata()["properties"].get("timeZone", "UTC"))
@@ -208,15 +232,38 @@ def sync_sheet(gc, sheet_id: str, wom: Wom, cache: dict, snapshot: str | None) -
         key = name.lower()
         if key not in cache:
             try:
-                cache[key] = ("ok", extract_metrics(wom.player(name), keys))
+                # Fetch current data
+                current_data = wom.player(name)
+                cache[key] = ("ok", extract_metrics(current_data, keys))
+                
+                # If baseline_date is set, also fetch historical snapshot
+                if baseline_date:
+                    snapshots = wom.snapshots(name, start_date=baseline_date - dt.timedelta(hours=1), end_date=baseline_date + dt.timedelta(hours=1))
+                    if snapshots:
+                        # Use the snapshot closest to baseline_date
+                        closest = min(snapshots, key=lambda s: abs(dt.datetime.fromisoformat(s["createdAt"].replace("Z", "+00:00")) - baseline_date))
+                        baseline_vals = extract_metrics_from_snapshot(closest["data"], keys)
+                        cache[f"{key}_baseline"] = ("ok", baseline_vals)
+                    else:
+                        # No snapshot found for date; fall back to current
+                        cache[f"{key}_baseline"] = ("ok", extract_metrics(current_data, keys))
             except WomError as e:
                 cache[key] = ("err", str(e))
+        
         state, payload = cache[key]
         if state == "ok":
             vals = [("" if v is None else v) for v in payload]
             row_base = prev_base[i]
             if snapshot == "force" or (snapshot == "missing" and all(b == "" for b in prev_base[i])):
-                row_base = vals
+                # If baseline_date was set, use the historical snapshot values
+                if baseline_date:
+                    baseline_state, baseline_payload = cache.get(f"{key}_baseline", (None, None))
+                    if baseline_state == "ok":
+                        row_base = [("" if v is None else v) for v in baseline_payload]
+                    else:
+                        row_base = vals  # Fall back to current if baseline fetch failed
+                else:
+                    row_base = vals
             new_cur.append(vals)
             new_base.append(row_base)
             meta.append([now_serial, "ok"])
@@ -225,76 +272,43 @@ def sync_sheet(gc, sheet_id: str, wom: Wom, cache: dict, snapshot: str | None) -
             # keep last good values; surface the error
             new_cur.append(prev_cur[i])
             new_base.append(prev_base[i])
-            meta.append(["", payload])  # timestamp restored below
+            meta.append(["", payload])
             failed += 1
             log.warning("%s: %s", name, payload)
 
-    # Preserve the old timestamp on failed rows
-    old_meta = with_retry(lambda: ws.get(f"B{FIRST_ROW}:B{LAST_ROW}", value_render_option="UNFORMATTED_VALUE"))
-    for i, m in enumerate(meta):
-        if names[i] and m[1] != "ok":
-            m[0] = old_meta[i][0] if i < len(old_meta) and old_meta[i] else ""
-
     updates = [
-        {"range": f"B{FIRST_ROW}:C{LAST_ROW}", "values": meta},
-        {"range": f"{col_letter(cur0)}{FIRST_ROW}:{col_letter(cur0 + n - 1)}{LAST_ROW}", "values": new_cur},
-        {"range": "B2:C2", "values": [[now_serial, f"{ok} ok, {failed} failed"]]},
+        {"range": f"{col_letter(cur0)}{FIRST_ROW}", "values": new_cur},
+        {"range": f"{col_letter(base0)}{FIRST_ROW}", "values": new_base},
+        {"range": f"B{FIRST_ROW}", "values": [[m[0]] for m in meta]},
+        {"range": f"C{FIRST_ROW}", "values": [[m[1]] for m in meta]},
+        {"range": f"B2", "values": [[now_serial, f"{ok} ok, {failed} failed"]]},
     ]
-    if snapshot:
-        updates.append(
-            {"range": f"{col_letter(base0)}{FIRST_ROW}:{col_letter(base0 + n - 1)}{LAST_ROW}", "values": new_base}
-        )
-    with_retry(lambda: ws.batch_update(updates, value_input_option="RAW"))
-    log.info("sheet %s: %d ok, %d failed", sheet_id, ok, failed)
+    with_retry(lambda: sh.batch_update({"data": updates}))
     return {"ok": ok, "failed": failed}
 
 
-# ---------------------------------------------------------------- orchestration
-def read_sheet_ids() -> list[str]:
-    env = os.environ.get("SHEET_IDS", "")
-    ids = [s.strip() for s in env.split(",") if s.strip()]
-    path = Path(os.environ.get("SHEETS_FILE", "/config/sheets.txt"))
-    if path.exists():
-        for line in path.read_text().splitlines():
-            line = line.split("#", 1)[0].strip()
-            if line:
-                ids.append(line.split()[0])
-    seen, out = set(), []
-    for i in ids:
-        if i not in seen:
-            seen.add(i)
-            out.append(i)
-    return out
-
-
-def alert(msg: str):
-    url = os.environ.get("DISCORD_WEBHOOK_URL")
-    if not url:
-        return
-    stamp = Path("/tmp/xp-sync-last-alert")
-    if stamp.exists() and time.time() - stamp.stat().st_mtime < 3600:
-        return
-    try:
-        requests.post(url, json={"content": f"xp-sync: {msg}"[:1900]}, timeout=10)
-        stamp.touch()
-    except requests.RequestException:
-        pass
-
-
-def run_once(gc, wom: Wom, snapshot: str | None, only: str | None = None) -> bool:
-    ids = [only] if only else read_sheet_ids()
-    if not ids:
-        log.error("no sheet ids configured (SHEETS_FILE or SHEET_IDS)")
-        return False
-    cache: dict = {}  # a player on several sheets is fetched once per run
+def run_once(gc, wom: Wom, snapshot: str | None, only: str | None = None, baseline_date: dt.datetime | None = None) -> bool:
+    """Run one sync cycle. Returns True if all sheets passed."""
+    ids = []
+    if only:
+        ids = [only]
+    else:
+        try:
+            with open(os.environ.get("SHEETS_FILE", "config/sheets.txt")) as f:
+                ids = [line.strip() for line in f if line.strip() and not line.startswith("#")]
+        except FileNotFoundError:
+            log.error("config/sheets.txt not found")
+            return False
+    
     all_ok = True
+    cache = {}
     for sid in ids:
         try:
-            res = sync_sheet(gc, sid, wom, cache, snapshot)
+            res = sync_sheet(gc, sid, wom, cache, snapshot, baseline_date)
             total = res["ok"] + res["failed"]
             if total and res["failed"] / total > 0.5:
                 alert(f"sheet {sid}: {res['failed']}/{total} players failed")
-        except Exception as e:  # sheet-level failure (auth, missing tab, ...)
+        except Exception as e:
             all_ok = False
             log.exception("sheet %s failed", sid)
             alert(f"sheet {sid} failed: {type(e).__name__}: {e}")
@@ -306,6 +320,7 @@ def main(argv=None) -> int:
     p.add_argument("--once", action="store_true", help="run a single sync and exit")
     p.add_argument("--snapshot-baseline", action="store_true",
                    help="fill BLANK baselines from current XP (late joiners included), then exit")
+    p.add_argument("--baseline-date", type=str, help="snapshot baselines from WOM at this date (ISO 8601, e.g., 2026-10-03T09:00:00-07:00)")
     p.add_argument("--force", action="store_true", help="with --snapshot-baseline: overwrite ALL baselines")
     p.add_argument("--sheet", help="limit to one spreadsheet id")
     args = p.parse_args(argv)
@@ -318,8 +333,13 @@ def main(argv=None) -> int:
               os.environ.get("WOM_USER_AGENT", "bsbg-xp-sync (Discord: set WOM_USER_AGENT)"))
     interval = int(os.environ.get("INTERVAL_SECONDS", "900"))
 
+    baseline_date = None
+    if args.baseline_date:
+        baseline_date = dt.datetime.fromisoformat(args.baseline_date)
+        log.info("snapshotting baselines from %s", baseline_date.isoformat())
+
     if args.snapshot_baseline:
-        ok = run_once(gc, wom, "force" if args.force else "missing", args.sheet)
+        ok = run_once(gc, wom, "force" if args.force else "missing", args.sheet, baseline_date)
         return 0 if ok else 1
     if args.once:
         return 0 if run_once(gc, wom, None, args.sheet) else 1
