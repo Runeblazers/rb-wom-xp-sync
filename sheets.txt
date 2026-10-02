@@ -1,0 +1,3 @@
+# One spreadsheet id per line; anything after # is a label.
+# Every sheet listed here must be shared (Editor) with the service account.
+1ndltzPH59D2wQjZg5pIXBnk8HZ5DxBbkIuz_QM9UI20   # BSBG_MASTER (team 1)

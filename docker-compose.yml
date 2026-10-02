@@ -1,0 +1,19 @@
+services:
+  xp-sync:
+    build: .
+    container_name: bsbg-xp-sync
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      TZ: America/Los_Angeles
+      GOOGLE_APPLICATION_CREDENTIALS: /run/secrets/sa.json
+      SHEETS_FILE: /config/sheets.txt
+    volumes:
+      - ./secrets/sa.json:/run/secrets/sa.json:ro
+      - ./config:/config:ro
+    healthcheck:
+      test: ["CMD", "python", "healthcheck.py"]
+      interval: 5m
+      timeout: 10s
+      retries: 1
+      start_period: 5m
