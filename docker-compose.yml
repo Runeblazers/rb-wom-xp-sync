@@ -6,6 +6,13 @@ services:
     env_file: .env
     environment:
       TZ: America/Los_Angeles
+      # Event window (ISO 8601 with UTC offset). Tracked here, not in .env, so the
+      # repo records what the event actually used. These override .env.
+      # Start is 09:10, not the announced 09:00: OSRS hiscores only update on
+      # logout/hop, so players online before 09:00 dumped pre-event XP into the
+      # first minutes (seen 09:03-09:05). See README "Hiscores lag".
+      EVENT_START_DATE: "2026-10-02T09:10:00-07:00"
+      EVENT_END_DATE: "2026-10-18T23:59:59-07:00"
       GOOGLE_APPLICATION_CREDENTIALS: /run/secrets/sa.json
       SHEETS_FILE: /config/sheets.txt
     volumes:

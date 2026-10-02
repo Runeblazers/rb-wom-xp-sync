@@ -134,7 +134,7 @@ If it fails, check:
 
 ### 8. Event start
 
-Nothing to run. Keep the container up across `EVENT_START_DATE`: it schedules a sync 5 seconds after the start so every player gets a snapshot right at the start, then syncs every 15 min on the clock. Gains come from WOM's `/players/:username/gained` for the event window.
+Nothing to run. The window is set in `docker-compose.yml` (`EVENT_START_DATE` / `EVENT_END_DATE`). Have players log out or hop before the start (see README, "Hiscores lag"). Keep the container up across `EVENT_START_DATE`: it schedules a sync 5 seconds after the start so every player gets a snapshot right at the start, then syncs every 15 min on the clock. Gains come from WOM's `/players/:username/gained` for the event window.
 
 ### 9. Start the service
 

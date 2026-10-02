@@ -24,12 +24,24 @@ shows 0 and C2 says when the event begins. If `EVENT_END_DATE` is set, gains fre
 unranked to ranked during the event gets credit for their full KC at that point (e.g. 0→5 even if they
 had 3 before). Minor, and the same as WOM's own competitions.
 
+## Hiscores lag (read before the next event)
+OSRS hiscores, and so WOM, only see a player's XP when they **log out or hop worlds**. Someone who logs in
+before the start and keeps playing has their pre-start XP appear on the hiscores at their next logout/hop, which
+counts as gained during the event. On 2026-10-02 two players showed +79k WC / +15k Agility at 09:03–09:05.
+The start was moved from 09:00 to **09:10** to exclude those jumps.
+
+For the next event:
+- Tell players to **log out or hop before the start** (at 08:55, say). The start-time sync then captures their real XP.
+- If an impossible jump still shows up mid-event, type a time just after it into that player's **Joined** cell.
+  This drops anything they earned between the start and that time, so use it only for clear dumps.
+
 ## Setup
 1. Per team sheet: share it with the service account email as **Editor** and add its id to `config/sheets.txt`
    (one per line, `#` comments allowed).
 2. On the server:
    ```bash
-   cp .env.example .env          # WOM_API_KEY, WOM_USER_AGENT, EVENT_START_DATE (+ optional EVENT_END_DATE)
+   cp .env.example .env          # WOM_API_KEY, WOM_USER_AGENT (secrets only)
+   # set EVENT_START_DATE / EVENT_END_DATE in docker-compose.yml and commit them
    mkdir -p secrets config && cp /path/to/service-account.json secrets/sa.json && chmod 600 secrets/sa.json
    docker compose up -d --build
    docker compose logs -f
