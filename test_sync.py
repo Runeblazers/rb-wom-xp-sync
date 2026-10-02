@@ -52,6 +52,8 @@ class FakeWS:
             return self.meta
         raise AssertionError(rng)
 
+    id = 2001
+
     def batch_update(self, updates, value_input_option=None):
         assert value_input_option == "RAW"
         self.written = updates
@@ -60,6 +62,10 @@ class FakeWS:
 class FakeSH:
     def __init__(self, ws):
         self.ws = ws
+        self.formats = None
+
+    def batch_update(self, body):
+        self.formats = body["requests"]
 
     def worksheet(self, _):
         return self.ws
@@ -457,3 +463,31 @@ def test_client_errors_do_not_trip_the_breaker(monkeypatch):
         with pytest.raises(sync.WomError):
             wom._request("POST", "/players/typo")
     assert wom.paused_until == 0.0
+
+
+# --- formats -------------------------------------------------------------------------
+
+def test_formats_reapplied_every_sync_for_script_columns():
+    ws = FakeWS(["agility", "mining"], ["Alice"], prev_ts=[46000.0], meta=[meta_row(synced="Alice")])
+    gc = FakeGC(ws)
+    CLOCK["t"] = DURING
+    sync.sync_sheet(gc, "sid", FakeWom({"alice": gained((0, 1234))}), {}, WINDOW, DURING)
+    reqs = [r["repeatCell"] for r in gc.sh.formats]
+    spans = {(r["range"]["startColumnIndex"], r["range"]["endColumnIndex"]): r["cell"]["userEnteredFormat"]["numberFormat"]["pattern"]
+             for r in reqs}
+    # 0-based column spans: B, D..E (two metrics), then Joined (G) and Locked at (I) after the spacer F
+    assert spans[(1, 2)] == "yyyy-mm-dd hh:mm"
+    assert spans[(3, 5)] == "#,##0"
+    assert spans[(6, 7)] == "yyyy-mm-dd hh:mm" and spans[(8, 9)] == "yyyy-mm-dd hh:mm"
+    assert all(r["range"]["startRowIndex"] == 6 and r["range"]["endRowIndex"] == 56 for r in reqs)
+    assert all(r["fields"] == "userEnteredFormat.numberFormat" for r in reqs)  # colours/alignment untouched
+
+
+def test_format_failure_never_fails_the_sync():
+    ws = FakeWS(["agility"], ["Alice"])
+    gc = FakeGC(ws)
+    def boom(body):
+        raise RuntimeError("quota")
+    gc.sh.batch_update = boom
+    CLOCK["t"] = DURING
+    assert sync.sync_sheet(gc, "sid", FakeWom({"alice": gained((0, 1))}), {}, WINDOW, DURING) == {"ok": 1, "failed": 0}

@@ -38,7 +38,7 @@ import gspread
 import requests
 from gspread.exceptions import APIError
 
-__version__ = "2.3.0"
+__version__ = "2.3.1"
 
 ROSTER_TAB = "Roster"
 FIRST_ROW, LAST_ROW = 7, 56
@@ -215,6 +215,30 @@ def with_retry(fn, attempts: int = 4):
 def sheet_serial(t: dt.datetime) -> float:
     """Sheets date serial (days since 1899-12-30), local wall time of t."""
     return (t.replace(tzinfo=None) - dt.datetime(1899, 12, 30)).total_seconds() / 86400
+
+
+DATE_FMT = {"type": "DATE_TIME", "pattern": "yyyy-mm-dd hh:mm"}
+NUM_FMT = {"type": "NUMBER", "pattern": "#,##0"}
+
+
+def format_requests(sheet_id: int, n: int, meta: dict[str, int]) -> list[dict]:
+    """Number formats for every script-written column, rows 7..56.
+
+    Values are written RAW, so they show in whatever format the cell already has. Formats
+    live on individual cells and get lost when rows are added, deleted, pasted or moved,
+    so the script re-applies them on every sync instead of relying on the template.
+    """
+    def fmt(c0: int, c1: int, number_format: dict) -> dict:
+        return {"repeatCell": {
+            "range": {"sheetId": sheet_id, "startRowIndex": FIRST_ROW - 1, "endRowIndex": LAST_ROW,
+                      "startColumnIndex": c0 - 1, "endColumnIndex": c1},
+            "cell": {"userEnteredFormat": {"numberFormat": number_format}},
+            "fields": "userEnteredFormat.numberFormat"}}
+    reqs = [fmt(2, 2, DATE_FMT), fmt(FIRST_COL, FIRST_COL + n - 1, NUM_FMT)]
+    for name in ("joined", "locked at"):
+        if name in meta:
+            reqs.append(fmt(meta[name], meta[name], DATE_FMT))
+    return reqs
 
 
 def utcnow() -> dt.datetime:
@@ -419,6 +443,10 @@ def sync_sheet(gc, sheet_id: str, wom: Wom, cache: dict, window, now: dt.datetim
             {"range": f"{col_letter(meta['synced as'])}{FIRST_ROW}", "values": synced_out},
         ]
     with_retry(lambda: ws.batch_update(updates, value_input_option="RAW"))
+    try:
+        with_retry(lambda: sh.batch_update({"requests": format_requests(ws.id, n, meta)}))
+    except Exception as e:  # cosmetic: never fail a sync over formatting
+        log.warning("sheet %s: could not re-apply number formats: %s", sheet_id, e)
     return {"ok": ok, "failed": failed}
 
 
