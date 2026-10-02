@@ -5,6 +5,6 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install -r requirements.txt
 COPY sync.py healthcheck.py ./
-RUN useradd -r -u 10001 sync
-USER sync
+RUN useradd -r -u 10001 xpsync
+USER xpsync
 CMD ["python", "sync.py"]

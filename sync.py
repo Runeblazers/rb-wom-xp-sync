@@ -33,7 +33,7 @@ import gspread
 import requests
 from gspread.exceptions import APIError
 
-__version__ = "1.1.0"
+__version__ = "1.1.1"
 
 ROSTER_TAB = "Roster"
 FIRST_ROW, LAST_ROW = 7, 56
@@ -172,11 +172,11 @@ def with_retry(fn, attempts: int = 3) -> any:
             time.sleep(1 + i)
 
 
-def sheet_serial(dt_obj: dt.datetime) -> int:
+def sheet_serial(dt_obj: dt.datetime) -> float:
     """Convert datetime to Excel serial number (days since 1900-01-01)."""
     epoch = dt.datetime(1899, 12, 30, tzinfo=dt.timezone.utc)
     delta = dt_obj.replace(tzinfo=None) - epoch.replace(tzinfo=None)
-    return int(delta.days) + int(delta.seconds / 86400)
+    return delta.total_seconds() / 86400
 
 
 def open_gspread(creds_path: str) -> gspread.Client:
@@ -204,9 +204,12 @@ def sync_sheet(gc, sheet_id: str, wom: Wom, cache: dict, snapshot: str | None, b
     tz = ZoneInfo(sh.fetch_sheet_metadata()["properties"].get("timeZone", "UTC"))
 
     header = with_retry(lambda: ws.get(f"{col_letter(CURRENT_FIRST_COL)}{HEADER_ROW}:AZ{HEADER_ROW}"))
-    keys = [str(c).strip() for c in (header[0] if header else [])]
-    while keys and not keys[-1]:
-        keys.pop()
+    keys = []
+    for c in (header[0] if header else []):
+        k = str(c).strip()
+        if not k or k in keys:  # header repeats keys for BASELINE/GAINED blocks; stop there
+            break
+        keys.append(k)
     if not keys:
         raise RuntimeError("no metric keys found in Roster header row")
     n = len(keys)
@@ -215,9 +218,9 @@ def sync_sheet(gc, sheet_id: str, wom: Wom, cache: dict, snapshot: str | None, b
 
     users = with_retry(lambda: ws.get(f"A{FIRST_ROW}:A{LAST_ROW}"))
     names = [pad(r, 1)[0].strip() for r in users] + [""] * (nrows - len(users))
-    prev_cur = with_retry(lambda: ws.get(f"{col_letter(cur0)}{FIRST_ROW}:{col_letter(cur0 + n - 1)}{LAST_ROW}"))
+    prev_cur = with_retry(lambda: ws.get(f"{col_letter(cur0)}{FIRST_ROW}:{col_letter(cur0 + n - 1)}{LAST_ROW}", value_render_option="UNFORMATTED_VALUE"))
     prev_cur = [pad(r, n) for r in prev_cur] + [[""] * n for _ in range(nrows - len(prev_cur))]
-    prev_base = with_retry(lambda: ws.get(f"{col_letter(base0)}{FIRST_ROW}:{col_letter(base0 + n - 1)}{LAST_ROW}"))
+    prev_base = with_retry(lambda: ws.get(f"{col_letter(base0)}{FIRST_ROW}:{col_letter(base0 + n - 1)}{LAST_ROW}", value_render_option="UNFORMATTED_VALUE"))
     prev_base = [pad(r, n) for r in prev_base] + [[""] * n for _ in range(nrows - len(prev_base))]
 
     now_serial = sheet_serial(dt.datetime.now(tz))
@@ -246,6 +249,7 @@ def sync_sheet(gc, sheet_id: str, wom: Wom, cache: dict, snapshot: str | None, b
                         cache[f"{key}_baseline"] = ("ok", baseline_vals)
                     else:
                         # No snapshot found for date; fall back to current
+                        log.warning("%s: no WOM snapshot near %s, baseline = current XP", name, baseline_date.isoformat())
                         cache[f"{key}_baseline"] = ("ok", extract_metrics(current_data, keys))
             except WomError as e:
                 cache[key] = ("err", str(e))
@@ -283,7 +287,7 @@ def sync_sheet(gc, sheet_id: str, wom: Wom, cache: dict, snapshot: str | None, b
         {"range": f"C{FIRST_ROW}", "values": [[m[1]] for m in meta]},
         {"range": f"B2", "values": [[now_serial, f"{ok} ok, {failed} failed"]]},
     ]
-    with_retry(lambda: sh.batch_update({"data": updates}))
+    with_retry(lambda: ws.batch_update(updates, value_input_option="RAW"))
     return {"ok": ok, "failed": failed}
 
 
