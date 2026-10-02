@@ -1,3 +1,5 @@
+> **Historical (v1.x).** Written for the baseline-snapshot design, replaced in v2.0.0 by WOM's `/gained` endpoint. See README.md for current behaviour.
+
 # Handoff: deploy `xp-sync` on the server
 
 You are setting up a small Dockerized Python service on Lucas's always-on server (the one that already runs his clan Discord bot). Everything is written and unit-tested; it has **not yet run against the real WOM API or Google Sheets**. Your job: deploy it, run the first live test, fix anything that differs from the assumptions below, and confirm it loops.

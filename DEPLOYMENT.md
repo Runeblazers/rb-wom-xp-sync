@@ -37,10 +37,7 @@ echo "1ndltzPH59D2wQjZg5pIXBnk8HZ5DxBbkIuz_QM9UI20" > config/sheets.txt
 # Build and test
 docker compose build
 docker compose run --rm xp-sync python sync.py --once
-# Check the sheet manually — should show current values in D7:L7
-
-# Snapshot baselines (event start)
-docker compose run --rm xp-sync python sync.py --snapshot-baseline
+# Check the sheet manually — before the event D7:L7 show 0 and C2 says when it starts
 
 # Start the service
 docker compose up -d
@@ -124,7 +121,7 @@ INFO xp-sync: sheet 1ndt...: 1 ok, 0 failed
 
 **Check the sheet:**
 - Open BSBG team sheet → Roster tab
-- Row 7 should have current XP/KC in columns D:L
+- Row 7 should have gains in columns D:L (0 before EVENT_START_DATE)
 - C7 should show "ok"
 - B7 should have a timestamp
 - B2:C2 should show "1 ok, 0 failed"
@@ -135,13 +132,9 @@ If it fails, check:
 - Username in A7 ✓
 - WOM API key correct (if using one) ✓
 
-### 8. Snapshot baselines (event start)
+### 8. Event start
 
-```bash
-docker compose run --rm xp-sync python sync.py --snapshot-baseline
-```
-
-This copies current XP → baseline for each player. Only fills blank baselines; won't overwrite existing.
+Nothing to run. Keep the container up across `EVENT_START_DATE`: it schedules a sync 5 seconds after the start so every player gets a snapshot right at the start, then syncs every 15 min on the clock. Gains come from WOM's `/players/:username/gained` for the event window.
 
 ### 9. Start the service
 
@@ -181,7 +174,7 @@ docker compose run --rm xp-sync python sync.py --once
 ## Adding a team
 
 1. Create a copy of the first team sheet
-2. Clear A7:A56 (usernames) and M7:U56 (baselines)
+2. Clear A7:A56 (usernames)
 3. Share the new sheet with `xp-sync@bsbg-sync.iam.gserviceaccount.com` as Editor
 4. Copy the sheet ID and add to config/sheets.txt:
    ```bash

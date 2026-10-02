@@ -1,3 +1,5 @@
+> **Historical (v1.x).** Written for the baseline-snapshot design, replaced in v2.0.0 by WOM's `/gained` endpoint. See README.md for current behaviour.
+
 # Code Review: rb-wom-xp-sync
 
 ## Verdict: Production-ready

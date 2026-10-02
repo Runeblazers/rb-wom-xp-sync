@@ -2,33 +2,31 @@ import datetime as dt
 
 import sync
 
+UTC = dt.timezone.utc
+START = dt.datetime(2026, 10, 3, 16, 0, tzinfo=UTC)  # 09:00 PDT
+WINDOW = (START, dt.datetime.max.replace(tzinfo=UTC))
+DURING = START + dt.timedelta(hours=2)
+
 
 class FakeWS:
-    """Minimal worksheet: dict of A1 cell -> value, supports the calls sync.py makes."""
-
-    def __init__(self, header, users, prev_cur=None, prev_base=None, old_ts=None):
-        self.n = len(header)
+    def __init__(self, header, users, prev=None, prev_ts=None):
         self.header, self.users = header, users
-        self.prev_cur = prev_cur or []
-        self.prev_base = prev_base or []
-        self.old_ts = old_ts or []
-        self.written = []
+        self.prev, self.prev_ts = prev or [], prev_ts or []
+        self.written = None
 
     def get(self, rng, value_render_option=None):
-        if rng.startswith("D5:"):
+        if rng == "D5:5":
             return [self.header]
         if rng.startswith("A7"):
             return [[u] for u in self.users]
         if rng.startswith("B7"):
-            return [[t] for t in self.old_ts]
-        c0 = sync.CURRENT_FIRST_COL
-        if rng.startswith(f"{sync.col_letter(c0)}7"):
-            return self.prev_cur
-        if rng.startswith(f"{sync.col_letter(c0 + self.n)}7"):
-            return self.prev_base
+            return [[t] for t in self.prev_ts]
+        if rng.startswith("D7"):
+            return self.prev
         raise AssertionError(rng)
 
     def batch_update(self, updates, value_input_option=None):
+        assert value_input_option == "RAW"
         self.written = updates
 
 
@@ -51,87 +49,104 @@ class FakeGC:
         return self.sh
 
 
+def g(start, end):
+    return {"start": start, "end": end, "gained": end - start}
+
+
+def gained(agility=(0, 0), mole=(0, 0), clues=None):
+    data = {"skills": {"agility": {"experience": g(*agility)}},
+            "bosses": {"giant_mole": {"kills": g(*mole)}},
+            "activities": {}}
+    if clues:
+        data["activities"]["clue_scrolls_all"] = {"score": g(*clues)}
+    return {"data": data}
+
+
 class FakeWom:
     def __init__(self, data):
-        self.data, self.calls = data, []
+        self.data, self.updates, self.gains = data, [], []
 
-    def player(self, name):
-        self.calls.append(name)
+    def update(self, name):
+        self.updates.append(name)
         v = self.data[name.lower()]
         if isinstance(v, Exception):
             raise v
-        return v
+
+    def gained(self, name, start, end):
+        self.gains.append((name, start, end))
+        return self.data[name.lower()]
 
 
-def details(agility=0, mole=0):
-    return {"latestSnapshot": {"data": {
-        "skills": {"agility": {"experience": agility}, "woodcutting": {"experience": -1}},
-        "bosses": {"giant_mole": {"kills": mole}},
-    }}}
-
-
-def test_extract_metrics_skill_boss_unranked_missing():
-    out = sync.extract_metrics(details(1234, 7), ["agility", "woodcutting", "giant_mole", "sailing"])
-    assert out == [1234, 0, 7, None]
-
-
-def test_col_letter():
-    assert [sync.col_letter(i) for i in (1, 4, 26, 27, 30)] == ["A", "D", "Z", "AA", "AD"]
-
-
-def run(ws, wom, snapshot=None, cache=None):
-    return sync.sync_sheet(FakeGC(ws), "sid", wom, cache if cache is not None else {}, snapshot)
+def run(ws, wom, now=DURING, cache=None):
+    return sync.sync_sheet(FakeGC(ws), "sid", wom, {} if cache is None else cache, WINDOW, now)
 
 
 def vals(ws, rng):
-    return next(u["values"] for u in ws.written if u["range"].startswith(rng))
+    return next(u["values"] for u in ws.written if u["range"] == rng)
 
 
-def test_sync_writes_current_and_status_and_keeps_failed_values():
+def test_extract_gains_types_unranked_and_unknown():
+    resp = gained(agility=(1000, 5000), mole=(-1, 7), clues=(10, 12))
+    out = sync.extract_gains(resp, ["agility", "giant_mole", "clue_scrolls_all", "sailing"])
+    assert out == [4000, 7, 2, None]
+
+
+def test_extract_gains_never_negative_and_unranked_end_is_zero():
+    resp = gained(agility=(5000, 4000), mole=(3, -1))
+    assert sync.extract_gains(resp, ["agility", "giant_mole"]) == [0, 0]
+
+
+def test_read_keys_stops_at_repeat_or_blank():
+    assert sync.read_keys(FakeWS(["agility", "giant_mole", "agility"], [])) == ["agility", "giant_mole"]
+    assert sync.read_keys(FakeWS(["agility", "", "mining"], [])) == ["agility"]
+
+
+def test_sync_writes_gains_status_and_keeps_failed_values():
     ws = FakeWS(["agility", "giant_mole"], ["Alice", "Bob", "", "Carol"],
-                prev_cur=[["", ""], [500, 9], ["", ""], ["", ""]], old_ts=[45000.5, 45000.5, "", ""])
-    wom = FakeWom({"alice": details(100, 2), "bob": sync.WomError("not found on WOM/hiscores"),
-                   "carol": details(300, 0)})
-    res = run(ws, wom)
-    assert res == {"ok": 2, "failed": 1}
-    cur = vals(ws, "D7")[:4]
-    assert cur[0] == [100, 2]
-    assert cur[1] == [500, 9]          # failed player keeps last good values
-    assert cur[2] == ["", ""]          # empty roster row
-    assert cur[3] == [300, 0]
-    meta = vals(ws, "B7")[:4]
-    assert meta[0][1] == "ok" and isinstance(meta[0][0], float)
-    assert meta[1] == [45000.5, "not found on WOM/hiscores"]   # old timestamp preserved
-    assert meta[2] == ["", ""]
+                prev=[["", ""], [500, 9], ["", ""], ["", ""]], prev_ts=[45000.5, 45000.5, "", ""])
+    wom = FakeWom({"alice": gained((0, 100), (0, 2)), "bob": sync.WomError("WOM 400: not on hiscores"),
+                   "carol": gained((10, 310), (1, 1))})
+    assert run(ws, wom) == {"ok": 2, "failed": 1}
+    rows = vals(ws, "D7")[:4]
+    assert rows == [[100, 2], [500, 9], ["", ""], [300, 0]]   # failed keeps last good gains
+    meta_ts, meta_st = vals(ws, "B7")[:4], vals(ws, "C7")[:4]
+    assert meta_st[0] == ["ok"] and isinstance(meta_ts[0][0], float)
+    assert meta_ts[1] == [45000.5] and meta_st[1] == ["WOM 400: not on hiscores"]
     assert vals(ws, "B2")[0][1] == "2 ok, 1 failed"
-    assert not any(u["range"].startswith("F7") for u in ws.written)  # baseline untouched
+    assert wom.gains[0][1:] == (START, DURING)
 
 
-def test_baseline_missing_only_fills_blanks_and_skips_failures():
-    ws = FakeWS(["agility", "giant_mole"], ["Alice", "Bob", "Carol"],
-                prev_cur=[[1, 1], [1, 1], [1, 1]],
-                prev_base=[[50, 1], ["", ""], ["", ""]])
-    wom = FakeWom({"alice": details(100, 2), "bob": details(200, 3), "carol": sync.WomError("rate limited")})
-    run(ws, wom, snapshot="missing")
-    base = vals(ws, "F7")[:3]
-    assert base[0] == [50, 1]      # existing baseline preserved
-    assert base[1] == [200, 3]     # blank filled
-    assert base[2] == ["", ""]     # failed player left blank, not zeroed
+def test_before_event_writes_zeros_but_still_validates_names():
+    ws = FakeWS(["agility"], ["Alice"])
+    wom = FakeWom({"alice": gained((0, 999))})
+    run(ws, wom, now=START - dt.timedelta(hours=1))
+    assert vals(ws, "D7")[0] == [0]
+    assert wom.updates == ["Alice"] and wom.gains == []
+    assert "event starts Sat 09:00" in vals(ws, "B2")[0][1]
 
 
-def test_baseline_force_overwrites_successes_only():
-    ws = FakeWS(["agility"], ["Alice", "Bob"], prev_cur=[[1], [1]], prev_base=[[50], [60]])
-    wom = FakeWom({"alice": details(100), "bob": sync.WomError("x")})
-    run(ws, wom, snapshot="force")
-    assert vals(ws, "E7")[:2] == [[100], [60]]
+def test_after_event_end_skips_update_and_clamps_end():
+    end = START + dt.timedelta(days=7)
+    ws = FakeWS(["agility"], ["Alice"])
+    wom = FakeWom({"alice": gained((0, 50))})
+    sync.sync_sheet(FakeGC(ws), "sid", wom, {}, (START, end), end + dt.timedelta(hours=3))
+    assert wom.updates == [] and wom.gains[0][2] == end
 
 
 def test_player_fetched_once_across_sheets():
-    wom, cache = FakeWom({"alice": details(1)}), {}
+    wom, cache = FakeWom({"alice": gained((0, 1))}), {}
     run(FakeWS(["agility"], ["Alice"]), wom, cache=cache)
     run(FakeWS(["agility"], ["alice"]), wom, cache=cache)
-    assert wom.calls == ["Alice"]
+    assert wom.updates == ["Alice"]
 
 
-def test_sheet_serial():
+def test_next_run_hits_event_start_then_boundaries():
+    start = 10_000 * 900  # on a 15-min boundary
+    assert sync.next_run(start - 300, 900, start) == start + sync.START_OFFSET_S
+    assert sync.next_run(start + 10, 900, start) == start + 900 + sync.START_OFFSET_S
+    assert sync.next_run(start - 3000, 900, start) == start - 2700 + sync.START_OFFSET_S
+
+
+def test_col_letter_and_serial():
+    assert [sync.col_letter(i) for i in (1, 4, 26, 27, 30)] == ["A", "D", "Z", "AA", "AD"]
     assert sync.sheet_serial(dt.datetime(1899, 12, 31, 12, 0)) == 1.5

@@ -2,15 +2,15 @@
 
 ## Overview
 
-**rb-wom-xp-sync** is a lightweight Python service that keeps Google Sheets in sync with player stats from the Wise Old Man (WOM) API. Built for Lucas's OSRS clan bingo event (BSBG), it fetches current XP and boss kill counts and writes them back to each team's tracking sheet.
+**rb-wom-xp-sync** is a lightweight Python service that keeps Google Sheets in sync with player stats from the Wise Old Man (WOM) API. Built for Lucas's OSRS clan bingo event (BSBG), it writes each player's XP / KC gained since the event start to each team's tracking sheet.
 
-**Key insight:** The sheet itself holds all the business logic (baselines, gains, team totals, leaderboards) as formulas. The service writes only raw current values; everything else is computed on the sheet.
+**Key insight:** WOM computes gains (`GET /players/:username/gained?startDate&endDate`), so there are no baselines. The service writes gains; the sheet only sums them (row 6) and the Tracker tab reads the totals.
 
 ## Design
 
 ### Data flow
 
-Usernames → WOM API (POST→GET) → Extract metrics → Batch write to Sheet
+Usernames → WOM `POST /players/:u` (fresh snapshot) → WOM `GET /players/:u/gained` (event window) → Batch write to Sheet
 
 - Sheets provide the UI, formulas, and state
 - Service is stateless (no database, no caching across runs)
@@ -21,9 +21,8 @@ Usernames → WOM API (POST→GET) → Extract metrics → Batch write to Sheet
 
 | Mode | Use case |
 |------|----------|
-| **Loop** (default) | Production: every INTERVAL_SECONDS (900s default) |
+| **Loop** (default) | Production: on wall-clock multiples of INTERVAL_SECONDS (900s), plus a run 5s after EVENT_START_DATE |
 | `--once` | Testing: run once and exit |
-| `--snapshot-baseline` | Event start: copy current → baseline |
 
 ### Error handling
 
@@ -60,7 +59,7 @@ All pinned to major versions for stability.
 7 unit tests (offline, no network, all passing):
 - Metric extraction
 - Column math
-- Sync logic (failures, baselines, deduplication)
+- Sync logic (gains extraction, failures, event window, scheduling, deduplication)
 - Sheet serial numbers
 
 Run: `pip install pytest && pytest test_sync.py`
