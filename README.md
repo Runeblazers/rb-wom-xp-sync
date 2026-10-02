@@ -48,9 +48,29 @@ had 3 before). Minor, and the same as WOM's own competitions.
 | `D5:L5` | you | WOM metric keys (`agility`, `giant_mole`, `clue_scrolls_all`, …) |
 | `B7:C56`, `D7:L56`, `B2:C2` | script | updated / status / gains / last sync |
 | `D6:L6` | sheet | `=SUM()` team totals (Tracker reads these) |
+| `N7:Q56` | you / script | roster changes, see below |
 
 To add a metric, add its WOM key in row 5 at the end of the block (and a `SUM` in row 6). The script
 reads keys until the first blank.
+
+## Roster changes (swaps)
+Columns N–Q on Roster (keep column M blank, because older versions read metric keys until the first blank):
+
+| Column | Who | Meaning |
+|---|---|---|
+| N **Joined** | script, editable | When this player started counting. Blank = event start. |
+| O **Lock** | you | Tick to freeze this player's gains. |
+| P **Locked at** | script | When the lock took effect. |
+| Q **synced as** | script (hidden) | Name last synced in this row, used to spot names typed over. |
+
+- **Swap someone out:** tick **Lock**. The next sync takes one final snapshot, stamps **Locked at**, and freezes
+  their gains. The row keeps counting toward the team total. Status shows `locked`. Untick to resume.
+- **Add someone:** put them in an empty row. The first sync after the event start that sees them stamps **Joined**
+  and counts only from then. To set an exact time, type a date-time into Joined (e.g. `2026-10-05 18:30`).
+  Clear Joined to count them from the event start.
+- **Don't type a new name over an existing player.** It works, but the old player's gains are dropped from the total.
+  The new name counts from that moment and Status says `replaced <old name>`.
+- A player moved between teams is tracked separately on each sheet (their own Joined / Locked at window).
 
 ## Adding a team
 Copy BSBG_MASTER, put usernames in A7:A56, share with the service account, and add the id to

@@ -38,7 +38,7 @@ import gspread
 import requests
 from gspread.exceptions import APIError
 
-__version__ = "2.1.0"
+__version__ = "2.2.0"
 
 ROSTER_TAB = "Roster"
 FIRST_ROW, LAST_ROW = 7, 56
@@ -170,45 +170,79 @@ def sheet_serial(t: dt.datetime) -> float:
     return (t.replace(tzinfo=None) - dt.datetime(1899, 12, 30)).total_seconds() / 86400
 
 
-def read_keys(ws) -> list[str]:
+def utcnow() -> dt.datetime:
+    return dt.datetime.now(dt.timezone.utc)
+
+
+# Row-5 headers (case-insensitive) for the optional roster-change columns. Keep a
+# blank column between the metric block and these so older versions ignore them.
+META = ("joined", "lock", "locked at", "synced as")
+
+
+def read_layout(ws) -> tuple[list[str], dict[str, int]]:
+    """Metric keys from D5 (until blank / repeat / meta header) and meta column numbers."""
     header = with_retry(lambda: ws.get(f"{col_letter(FIRST_COL)}{HEADER_ROW}:{HEADER_ROW}"))
+    cells = [str(c).strip() for c in (header[0] if header else [])]
     keys = []
-    for c in (header[0] if header else []):
-        k = str(c).strip()
-        if not k or k in keys:
+    for k in cells:
+        if not k or k in keys or k.lower() in META:
             break
         keys.append(k)
     if not keys:
         raise RuntimeError("no metric keys found in Roster header row 5")
-    return keys
+    meta = {c.lower(): FIRST_COL + i for i, c in enumerate(cells) if c.lower() in META}
+    return keys, (meta if len(meta) == len(META) else {})
+
+
+def read_keys(ws) -> list[str]:
+    return read_layout(ws)[0]
+
+
+def from_serial(v, tz) -> dt.datetime | None:
+    """Sheets date serial -> aware datetime in the sheet's timezone. '' -> None."""
+    if v in ("", None):
+        return None
+    if isinstance(v, bool) or not isinstance(v, (int, float)):
+        raise ValueError(f"not a date: {v!r}")
+    return (dt.datetime(1899, 12, 30) + dt.timedelta(days=v)).replace(tzinfo=tz)
 
 
 def fetch_player(wom: Wom, name: str, keys: list[str], window: tuple[dt.datetime, dt.datetime],
                  now: dt.datetime) -> list[int | None]:
+    """Gains for one player over window = (start, end).
+
+    The fresh snapshot from update() is taken *after* `now`, so the gains window
+    is closed at the current time after the update, not at `now`; otherwise every
+    sync would report the previous cycle's numbers.
+    """
     start, end = window
-    if now < end:  # no point refreshing after the event is over
+    if now < end:  # no point refreshing once the window has closed
         wom.update(name)
     if now < start:
         return [0] * len(keys)
-    return extract_gains(wom.gained(name, start, min(now, end)), keys)
+    stop = min(utcnow(), end)
+    if stop <= start:
+        return [0] * len(keys)
+    return extract_gains(wom.gained(name, start, stop), keys)
 
 
-def guard(name: str, vals: list, high: dict) -> list:
-    """Never report lower gains than already reported for this player.
+def guard(key, vals: list, high: dict, name: str = "") -> list:
+    """Never report lower gains than already reported for this player + window.
 
-    Gains over a fixed window can only grow, so a lower value or a missing one
-    means WOM returned something incomplete; keep the best value seen instead.
-    Keyed by player name (not sheet row) so moving or replacing a roster row
-    never hands one player's gains to another. In-memory: resets on restart.
+    Gains over a fixed start can only grow, so a lower or missing value means WOM
+    returned something incomplete; keep the best value seen instead. Keyed by
+    player and window start (not sheet row), so moving or replacing a roster row,
+    or a player re-joining another team, never inherits someone else's numbers.
+    In-memory: resets on restart.
     """
-    best = high.get(name.lower(), [None] * len(vals))
+    best = high.get(key, [None] * len(vals))
     out = []
     for v, b in zip(vals, best):
         if b is not None and (v is None or v < b):
-            log.warning("%s: WOM returned %s, keeping %s", name, v, b)
+            log.warning("%s: WOM returned %s, keeping %s", name or key, v, b)
             v = b
         out.append(v)
-    high[name.lower()] = out
+    high[key] = out
     return out
 
 
@@ -217,60 +251,115 @@ def sync_sheet(gc, sheet_id: str, wom: Wom, cache: dict, window, now: dt.datetim
     sh = with_retry(lambda: gc.open_by_key(sheet_id))
     ws = with_retry(lambda: sh.worksheet(ROSTER_TAB))
     tz = ZoneInfo(sh.fetch_sheet_metadata()["properties"].get("timeZone", "UTC"))
-    now = now or dt.datetime.now(dt.timezone.utc)
+    now = now or utcnow()
+    ev_start, ev_end = window
+    started = now >= ev_start
 
-    keys = read_keys(ws)
+    keys, meta = read_layout(ws)
     n = len(keys)
     nrows = LAST_ROW - FIRST_ROW + 1
-    last_col = col_letter(FIRST_COL + n - 1)
+    rng = lambda c0, c1: f"{col_letter(c0)}{FIRST_ROW}:{col_letter(c1)}{LAST_ROW}"
+    raw = lambda r: with_retry(lambda: ws.get(r, value_render_option="UNFORMATTED_VALUE"))
+    rows = lambda vals, w: [pad(r, w) for r in vals] + [[""] * w for _ in range(nrows - len(vals))]
 
     users = with_retry(lambda: ws.get(f"A{FIRST_ROW}:A{LAST_ROW}"))
     names = [pad(r, 1)[0].strip() for r in users] + [""] * (nrows - len(users))
-    prev = with_retry(lambda: ws.get(f"{col_letter(FIRST_COL)}{FIRST_ROW}:{last_col}{LAST_ROW}",
-                                     value_render_option="UNFORMATTED_VALUE"))
-    prev = [pad(r, n) for r in prev] + [[""] * n for _ in range(nrows - len(prev))]
-    prev_ts = with_retry(lambda: ws.get(f"B{FIRST_ROW}:B{LAST_ROW}", value_render_option="UNFORMATTED_VALUE"))
-    prev_ts = [pad(r, 1)[0] for r in prev_ts] + [""] * (nrows - len(prev_ts))
+    prev = rows(raw(rng(FIRST_COL, FIRST_COL + n - 1)), n)
+    prev_ts = [r[0] for r in rows(raw(f"B{FIRST_ROW}:B{LAST_ROW}"), 1)]
+    if meta:
+        lo, hi = min(meta.values()), max(meta.values())
+        mrows = rows(raw(rng(lo, hi)), hi - lo + 1)
+        cell = lambda i, k: mrows[i][meta[k] - lo]
 
     now_serial = sheet_serial(now.astimezone(tz))
-    out, meta = [], []
+    ser = lambda t: sheet_serial(t.astimezone(tz)) if t else ""
+    out, meta_out, joined_out, locked_out, synced_out = [], [], [], [], []
     ok = failed = 0
     for i, name in enumerate(names):
+        j_raw = l_raw = s_raw = ""
+        if meta:
+            j_raw, l_raw, s_raw = cell(i, "joined"), cell(i, "locked at"), str(cell(i, "synced as")).strip()
         if not name:
             out.append([""] * n)
-            meta.append(["", ""])
+            meta_out.append(["", ""])
+            joined_out.append([j_raw]); locked_out.append([l_raw]); synced_out.append([""])
             continue
-        key = name.lower()
+
+        note = ""
+        joined = locked_at = None
+        rstart, rend = ev_start, ev_end
+        try:
+            if meta:
+                joined, locked_at = from_serial(j_raw, tz), from_serial(l_raw, tz)
+                lock = cell(i, "lock") is True or str(cell(i, "lock")).upper() == "TRUE"
+                if started and joined is None:
+                    if s_raw and s_raw.lower() != name.lower():
+                        joined = now  # name typed over another player's row
+                        note = f" | replaced {s_raw}: their gains were dropped (use Lock + a new row)"
+                        log.warning("%s: row was %s; counting %s from now", name, s_raw, name)
+                    elif not s_raw and prev_ts[i] in ("", None):
+                        joined = now  # brand-new row added after the start
+                if not lock:
+                    locked_at = None
+                elif locked_at is None and started:
+                    wom.update(name)  # final snapshot, then close the window after it
+                    locked_at = utcnow()
+                rstart = max(ev_start, joined) if joined else ev_start
+                rend = min(ev_end, locked_at) if locked_at else ev_end
+        except ValueError:
+            out.append(prev[i]); meta_out.append([prev_ts[i], "Joined / Locked at must be a date and time"])
+            joined_out.append([j_raw]); locked_out.append([l_raw]); synced_out.append([s_raw])
+            failed += 1
+            continue
+        except WomError as e:  # lock's final update failed: retry the lock next cycle
+            out.append(prev[i]); meta_out.append([prev_ts[i], f"lock pending: {e}"])
+            joined_out.append([j_raw]); locked_out.append([l_raw]); synced_out.append([s_raw])
+            failed += 1
+            continue
+
+        key = (name.lower(), rstart.isoformat(), rend.isoformat())
         if key not in cache:
             try:
-                cache[key] = ("ok", fetch_player(wom, name, keys, window, now))
+                cache[key] = ("ok", fetch_player(wom, name, keys, (rstart, rend), now))
             except WomError as e:
                 cache[key] = ("err", str(e))
         state, payload = cache[key]
         if state == "ok" and high is not None:
-            payload = guard(name, payload, high)
+            payload = guard((name.lower(), rstart.isoformat()), payload, high, name)
             cache[key] = (state, payload)
+
+        joined_out.append([ser(joined)]); locked_out.append([ser(locked_at)])
         if state == "ok":
             unknown = [k for k, v in zip(keys, payload) if v is None]
+            status = "locked" if locked_at else "ok"
+            if unknown:
+                status += f" (unknown metric: {', '.join(unknown)})"
             out.append([("" if v is None else v) for v in payload])
-            meta.append([now_serial, f"ok (unknown metric: {', '.join(unknown)})" if unknown else "ok"])
+            meta_out.append([now_serial, status + note])
+            synced_out.append([name])
             ok += 1
         else:
             out.append(prev[i])  # keep last good gains
-            meta.append([prev_ts[i], payload])
+            meta_out.append([prev_ts[i], payload])
+            synced_out.append([s_raw or ""])
             failed += 1
             log.warning("%s: %s", name, payload)
 
-    start, _ = window
     summary = f"{ok} ok, {failed} failed"
-    if now < start:
-        summary += f" | event starts {start.astimezone(tz):%a %H:%M}"
+    if not started:
+        summary += f" | event starts {ev_start.astimezone(tz):%a %H:%M}"
     updates = [
         {"range": f"{col_letter(FIRST_COL)}{FIRST_ROW}", "values": out},
-        {"range": f"B{FIRST_ROW}", "values": [[m[0]] for m in meta]},
-        {"range": f"C{FIRST_ROW}", "values": [[m[1]] for m in meta]},
+        {"range": f"B{FIRST_ROW}", "values": [[m[0]] for m in meta_out]},
+        {"range": f"C{FIRST_ROW}", "values": [[m[1]] for m in meta_out]},
         {"range": "B2", "values": [[now_serial, summary]]},
     ]
+    if meta:
+        updates += [
+            {"range": f"{col_letter(meta['joined'])}{FIRST_ROW}", "values": joined_out},
+            {"range": f"{col_letter(meta['locked at'])}{FIRST_ROW}", "values": locked_out},
+            {"range": f"{col_letter(meta['synced as'])}{FIRST_ROW}", "values": synced_out},
+        ]
     with_retry(lambda: ws.batch_update(updates, value_input_option="RAW"))
     return {"ok": ok, "failed": failed}
 
