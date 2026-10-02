@@ -352,3 +352,108 @@ def test_sheet_without_meta_columns_still_works():
     run(ws, FakeWom({"alice": gained((0, 5))}))
     assert vals(ws, "D7")[0] == [5]
     assert len(ws.written) == 4  # gains, B, C, B2 only
+
+
+# --- WOM resilience ------------------------------------------------------------------
+
+class FakeResp:
+    def __init__(self, status, body=None, text="", reason="Bad Gateway"):
+        self.status_code, self._body, self.text, self.reason = status, body, text, reason
+
+    def json(self):
+        if self._body is None:
+            raise ValueError("not json")
+        return self._body
+
+
+HTML_502 = '<!DOCTYPE html>\n<!--[if lt IE 7]> <html class="no-js ie6 oldie" lang="en-US"> <![endif]-->'
+
+
+def test_error_message_never_dumps_html():
+    assert sync.error_message(FakeResp(502, text=HTML_502)) == "Bad Gateway"
+    assert sync.error_message(FakeResp(400, body={"message": "Invalid username"})) == "Invalid username"
+    assert "\n" not in sync.error_message(FakeResp(500, text="line one\nline two"))
+
+
+def _wom_with(monkeypatch, responses):
+    calls = []
+    def fake_request(method, url, **kw):
+        calls.append((method, kw["timeout"]))
+        r = responses.pop(0)
+        if isinstance(r, Exception):
+            raise r
+        return r
+    monkeypatch.setattr(sync.requests, "request", fake_request)
+    monkeypatch.setattr(sync.time, "sleep", lambda s: None)
+    return sync.Wom("key", "test"), calls
+
+
+def test_request_retries_transient_failures_then_succeeds(monkeypatch):
+    wom, calls = _wom_with(monkeypatch, [
+        sync.requests.exceptions.ReadTimeout(), FakeResp(502, text=HTML_502), FakeResp(200, body={"ok": 1})])
+    assert wom._request("POST", "/players/x") == {"ok": 1}
+    assert calls == [("POST", 30)] * 3
+
+
+def test_request_gives_up_with_a_short_message(monkeypatch):
+    wom, calls = _wom_with(monkeypatch, [sync.requests.exceptions.ReadTimeout()] * 3)
+    with pytest.raises(sync.WomError, match=r"^WOM unreachable \(ReadTimeout\)$"):
+        wom._request("GET", "/players/x/gained")
+    assert len(calls) == 3
+
+
+def test_request_does_not_retry_client_errors(monkeypatch):
+    wom, calls = _wom_with(monkeypatch, [FakeResp(400, body={"message": "Invalid username"})])
+    with pytest.raises(sync.WomError, match="WOM 400: Invalid username"):
+        wom._request("POST", "/players/x")
+    assert len(calls) == 1
+
+
+def test_refresh_outage_still_reports_gains_from_existing_snapshots():
+    ws = FakeWS(["agility"], ["Alice", "Bob"], prev=[[5], [9]], prev_ts=[46000.0, 46000.0])
+    wom = FakeWom({"alice": gained((0, 40)), "bob": gained((0, 50))})
+    def flaky_update(name):
+        wom.updates.append(name)
+        if name == "Alice":
+            raise sync.WomError("WOM unreachable (ReadTimeout)")
+    wom.update = flaky_update
+    assert run(ws, wom) == {"ok": 2, "failed": 0}
+    assert vals(ws, "D7")[:2] == [[40], [50]]
+    assert vals(ws, "C7")[0][0] == "ok (WOM refresh failed, showing last snapshot)"
+    assert vals(ws, "C7")[1] == ["ok"]
+
+
+def test_gained_outage_keeps_last_good_values():
+    ws = FakeWS(["agility"], ["Alice"], prev=[[77]], prev_ts=[46000.5])
+    wom = FakeWom({"alice": gained((0, 1))})
+    def down(*a):
+        raise sync.WomError("WOM 502: Bad Gateway")
+    wom.gained = down
+    assert run(ws, wom) == {"ok": 0, "failed": 1}
+    assert vals(ws, "D7")[0] == [77] and vals(ws, "B7")[0] == [46000.5]
+    assert vals(ws, "C7")[0] == ["WOM 502: Bad Gateway"]
+
+
+def test_breaker_stops_calling_wom_after_repeated_failures(monkeypatch):
+    wom, calls = _wom_with(monkeypatch, [sync.requests.exceptions.ConnectTimeout()] * 9)
+    clock = {"t": 1000.0}
+    monkeypatch.setattr(sync.time, "time", lambda: clock["t"])
+    for _ in range(3):
+        with pytest.raises(sync.WomError):
+            wom._request("GET", "/x")
+    assert len(calls) == 9
+    with pytest.raises(sync.WomError, match="paused"):
+        wom._request("GET", "/x")
+    assert len(calls) == 9                       # no network while paused
+    clock["t"] += sync.Wom.BREAKER_PAUSE + 1
+    monkeypatch.setattr(sync.requests, "request", lambda *a, **k: FakeResp(200, body={"ok": 1}))
+    assert wom._request("GET", "/x") == {"ok": 1}
+    assert wom.failures_in_a_row == 0
+
+
+def test_client_errors_do_not_trip_the_breaker(monkeypatch):
+    wom, _ = _wom_with(monkeypatch, [FakeResp(400, body={"message": "Invalid username"})] * 5)
+    for _ in range(5):
+        with pytest.raises(sync.WomError):
+            wom._request("POST", "/players/typo")
+    assert wom.paused_until == 0.0

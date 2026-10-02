@@ -88,6 +88,15 @@ Columns N–Q on Roster (keep column M blank, because older versions read metric
 Copy BSBG_MASTER, put usernames in A7:A56, share with the service account, and add the id to
 `config/sheets.txt`. The next cycle picks it up with no rebuild.
 
+## When WOM is slow or down
+Every WOM call is retried twice (after 2 s and 6 s) on timeouts, dropped connections and 5xx errors.
+- **Refresh fails, gains read OK:** the row still updates from WOM's existing snapshots. Status reads
+  `ok (WOM refresh failed, showing last snapshot)`.
+- **Gains can't be read either:** the row keeps its last good numbers and Updated time. Status shows a
+  short reason, e.g. `WOM 502: Bad Gateway` or `WOM unreachable (ReadTimeout)`.
+- **WOM fully down:** after 3 calls in a row fail, WOM calls pause for 5 minutes. The round finishes
+  quickly and no values are lost. It catches up on the next round.
+
 ## Troubleshooting
 - `403`/`PERMISSION_DENIED`: sheet not shared with the service account.
 - `Requested entity was not found`: wrong sheet id, or no `Roster` tab.

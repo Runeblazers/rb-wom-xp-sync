@@ -38,7 +38,7 @@ import gspread
 import requests
 from gspread.exceptions import APIError
 
-__version__ = "2.2.0"
+__version__ = "2.3.0"
 
 ROSTER_TAB = "Roster"
 FIRST_ROW, LAST_ROW = 7, 56
@@ -62,6 +62,8 @@ class Wom:
         self.user_agent = user_agent
         self.throttle = 0.7 if api_key else 3.2  # seconds between requests
         self.last_req = 0.0
+        self.failures_in_a_row = 0
+        self.paused_until = 0.0
 
     def _wait(self):
         wait = self.last_req + self.throttle - time.time()
@@ -69,22 +71,57 @@ class Wom:
             time.sleep(wait)
         self.last_req = time.time()
 
+    RETRY_WAITS = (2, 6)       # seconds before the 2nd and 3rd attempt
+    TRANSIENT = {500, 502, 503, 504}
+    # A POST makes WOM fetch the OSRS hiscores, which can be slow when Jagex is busy.
+    TIMEOUTS = {"POST": 30, "GET": 20}
+
+    BREAKER_AFTER = 3          # calls that exhaust their retries in a row ...
+    BREAKER_PAUSE = 300        # ... pause WOM calls for this many seconds
+
     def _request(self, method: str, path: str, params: dict | None = None) -> dict:
-        self._wait()
+        """One WOM call, retried on timeouts / dropped connections / 5xx.
+
+        If WOM is down (several calls in a row fail even after retries), stop calling it for
+        a few minutes so a sync finishes quickly and every row keeps its last good values,
+        instead of each player waiting out its own timeouts.
+        """
+        if time.time() < self.paused_until:
+            raise WomError("WOM unreachable (paused after repeated failures)")
+        try:
+            result = self._attempts(method, path, params)
+        except WomError as e:
+            if str(e).startswith(("WOM unreachable", "WOM 5")):
+                self.failures_in_a_row += 1
+                if self.failures_in_a_row >= self.BREAKER_AFTER:
+                    self.paused_until = time.time() + self.BREAKER_PAUSE
+                    log.warning("WOM failing repeatedly; pausing WOM calls for %ds", self.BREAKER_PAUSE)
+            raise
+        self.failures_in_a_row = 0
+        return result
+
+    def _attempts(self, method: str, path: str, params: dict | None) -> dict:
         headers = {"User-Agent": self.user_agent}
         if self.api_key:
             headers["x-api-key"] = self.api_key
-        try:
-            r = requests.request(method, f"{self.BASE}{path}", headers=headers, params=params, timeout=15)
-        except requests.exceptions.RequestException as e:
-            raise WomError(f"network: {type(e).__name__}") from e
-        if r.status_code >= 400:
+        for attempt in range(len(self.RETRY_WAITS) + 1):
+            if attempt:
+                time.sleep(self.RETRY_WAITS[attempt - 1])
+            self._wait()
             try:
-                msg = r.json().get("message", "")
-            except ValueError:
-                msg = r.text[:120]
-            raise WomError(f"WOM {r.status_code}: {msg}".strip())
-        return r.json()
+                r = requests.request(method, f"{self.BASE}{path}", headers=headers, params=params,
+                                     timeout=self.TIMEOUTS.get(method, 20))
+            except requests.exceptions.RequestException as e:
+                err = WomError(f"WOM unreachable ({type(e).__name__})")
+                continue
+            if r.status_code in self.TRANSIENT:
+                err = WomError(f"WOM {r.status_code}: {error_message(r)}")
+                continue
+            if r.status_code >= 400:
+                raise WomError(f"WOM {r.status_code}: {error_message(r)}")
+            return r.json()
+        log.info("%s %s: giving up after %d attempts: %s", method, path, attempt + 1, err)
+        raise err
 
     def update(self, username: str) -> None:
         """POST /players/:username -> WOM fetches hiscores and stores a snapshot.
@@ -104,6 +141,16 @@ class Wom:
         """GET /players/:username/gained for an explicit date range."""
         params = {"startDate": iso_utc(start), "endDate": iso_utc(end)}
         return self._request("GET", f"/players/{urllib.parse.quote(username)}/gained", params=params)
+
+
+def error_message(r) -> str:
+    """Short, single-line reason from a WOM error response (never a raw HTML page)."""
+    try:
+        msg = str(r.json().get("message", ""))
+    except ValueError:
+        msg = "" if r.text.lstrip().startswith("<") else r.text
+    msg = " ".join(msg.split()) or (r.reason or "server error")
+    return msg[:100]
 
 
 def iso_utc(t: dt.datetime) -> str:
@@ -208,22 +255,33 @@ def from_serial(v, tz) -> dt.datetime | None:
 
 
 def fetch_player(wom: Wom, name: str, keys: list[str], window: tuple[dt.datetime, dt.datetime],
-                 now: dt.datetime) -> list[int | None]:
-    """Gains for one player over window = (start, end).
+                 now: dt.datetime) -> tuple[list[int | None], str]:
+    """Gains for one player over window = (start, end), plus a status note.
+
+    If WOM can't refresh the player (hiscores slow, WOM hiccup) the gains are still
+    read from the snapshots WOM already has, so the row stays current to the last
+    good refresh instead of failing outright.
 
     The fresh snapshot from update() is taken *after* `now`, so the gains window
     is closed at the current time after the update, not at `now`; otherwise every
     sync would report the previous cycle's numbers.
     """
     start, end = window
+    note = ""
     if now < end:  # no point refreshing once the window has closed
-        wom.update(name)
+        try:
+            wom.update(name)
+        except WomError as e:
+            if not str(e).startswith(("WOM unreachable", "WOM 5")):
+                raise  # e.g. 400 not on hiscores: a real problem with this player
+            note = " (WOM refresh failed, showing last snapshot)"
+            log.warning("%s: refresh failed (%s); using existing snapshots", name, e)
     if now < start:
-        return [0] * len(keys)
+        return [0] * len(keys), note
     stop = min(utcnow(), end)
     if stop <= start:
-        return [0] * len(keys)
-    return extract_gains(wom.gained(name, start, stop), keys)
+        return [0] * len(keys), note
+    return extract_gains(wom.gained(name, start, stop), keys), note
 
 
 def guard(key, vals: list, high: dict, name: str = "") -> list:
@@ -320,13 +378,13 @@ def sync_sheet(gc, sheet_id: str, wom: Wom, cache: dict, window, now: dt.datetim
         key = (name.lower(), rstart.isoformat(), rend.isoformat())
         if key not in cache:
             try:
-                cache[key] = ("ok", fetch_player(wom, name, keys, (rstart, rend), now))
+                cache[key] = ("ok", *fetch_player(wom, name, keys, (rstart, rend), now))
             except WomError as e:
-                cache[key] = ("err", str(e))
-        state, payload = cache[key]
+                cache[key] = ("err", str(e), "")
+        state, payload, fetch_note = cache[key]
         if state == "ok" and high is not None:
             payload = guard((name.lower(), rstart.isoformat()), payload, high, name)
-            cache[key] = (state, payload)
+            cache[key] = (state, payload, fetch_note)
 
         joined_out.append([ser(joined)]); locked_out.append([ser(locked_at)])
         if state == "ok":
@@ -335,7 +393,7 @@ def sync_sheet(gc, sheet_id: str, wom: Wom, cache: dict, window, now: dt.datetim
             if unknown:
                 status += f" (unknown metric: {', '.join(unknown)})"
             out.append([("" if v is None else v) for v in payload])
-            meta_out.append([now_serial, status + note])
+            meta_out.append([now_serial, status + fetch_note + note])
             synced_out.append([name])
             ok += 1
         else:
