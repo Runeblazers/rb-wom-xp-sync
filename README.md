@@ -12,6 +12,8 @@ Every `INTERVAL_SECONDS` (default 900, aligned to the wall clock: :00, :15, :30,
 
 No baselines and no subtraction in the sheet. Row 6 `TEAM TOTAL` sums the columns and the Tracker tab
 reads `Roster!D6:L6`. Failed players keep their last good gains and show the error in Status.
+A player's gains never go down: if WOM returns a lower or missing value, the best value seen so far
+is kept and a warning is logged. This is tracked per player name, in memory, and resets when the container restarts.
 
 **Timing.** WOM measures gains between the first and last snapshot *inside* the window, so the service
 schedules a sync for `EVENT_START_DATE + 5s`. Each player's first counted snapshot is taken within about a

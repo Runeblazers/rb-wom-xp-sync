@@ -38,7 +38,7 @@ import gspread
 import requests
 from gspread.exceptions import APIError
 
-__version__ = "2.0.0"
+__version__ = "2.1.0"
 
 ROSTER_TAB = "Roster"
 FIRST_ROW, LAST_ROW = 7, 56
@@ -193,7 +193,27 @@ def fetch_player(wom: Wom, name: str, keys: list[str], window: tuple[dt.datetime
     return extract_gains(wom.gained(name, start, min(now, end)), keys)
 
 
-def sync_sheet(gc, sheet_id: str, wom: Wom, cache: dict, window, now: dt.datetime | None = None) -> dict:
+def guard(name: str, vals: list, high: dict) -> list:
+    """Never report lower gains than already reported for this player.
+
+    Gains over a fixed window can only grow, so a lower value or a missing one
+    means WOM returned something incomplete; keep the best value seen instead.
+    Keyed by player name (not sheet row) so moving or replacing a roster row
+    never hands one player's gains to another. In-memory: resets on restart.
+    """
+    best = high.get(name.lower(), [None] * len(vals))
+    out = []
+    for v, b in zip(vals, best):
+        if b is not None and (v is None or v < b):
+            log.warning("%s: WOM returned %s, keeping %s", name, v, b)
+            v = b
+        out.append(v)
+    high[name.lower()] = out
+    return out
+
+
+def sync_sheet(gc, sheet_id: str, wom: Wom, cache: dict, window, now: dt.datetime | None = None,
+               high: dict | None = None) -> dict:
     sh = with_retry(lambda: gc.open_by_key(sheet_id))
     ws = with_retry(lambda: sh.worksheet(ROSTER_TAB))
     tz = ZoneInfo(sh.fetch_sheet_metadata()["properties"].get("timeZone", "UTC"))
@@ -227,6 +247,9 @@ def sync_sheet(gc, sheet_id: str, wom: Wom, cache: dict, window, now: dt.datetim
             except WomError as e:
                 cache[key] = ("err", str(e))
         state, payload = cache[key]
+        if state == "ok" and high is not None:
+            payload = guard(name, payload, high)
+            cache[key] = (state, payload)
         if state == "ok":
             unknown = [k for k, v in zip(keys, payload) if v is None]
             out.append([("" if v is None else v) for v in payload])
@@ -269,7 +292,7 @@ def load_sheet_ids(only: str | None) -> list[str]:
         return [ln.split("#")[0].strip() for ln in f if ln.split("#")[0].strip()]
 
 
-def run_once(gc, wom: Wom, window, only: str | None = None) -> bool:
+def run_once(gc, wom: Wom, window, only: str | None = None, high: dict | None = None) -> bool:
     try:
         ids = load_sheet_ids(only)
     except FileNotFoundError:
@@ -278,7 +301,7 @@ def run_once(gc, wom: Wom, window, only: str | None = None) -> bool:
     all_ok, cache = True, {}
     for sid in ids:
         try:
-            res = sync_sheet(gc, sid, wom, cache, window)
+            res = sync_sheet(gc, sid, wom, cache, window, high=high)
             log.info("sheet %s: %d ok, %d failed", sid, res["ok"], res["failed"])
             total = res["ok"] + res["failed"]
             if total and res["failed"] / total > 0.5:
@@ -334,8 +357,9 @@ def main(argv=None) -> int:
     for sig in (signal.SIGTERM, signal.SIGINT):
         signal.signal(sig, lambda *_: stop.set())
     start_ts = window[0].timestamp()
+    high: dict = {}  # best gains reported per player this process
     while not stop.is_set():
-        if run_once(gc, wom, window, args.sheet):
+        if run_once(gc, wom, window, args.sheet, high):
             HEARTBEAT.touch()
         wake = next_run(time.time(), interval, start_ts)
         log.info("next sync at %s", dt.datetime.fromtimestamp(wake).astimezone().strftime("%H:%M:%S"))

@@ -150,3 +150,21 @@ def test_next_run_hits_event_start_then_boundaries():
 def test_col_letter_and_serial():
     assert [sync.col_letter(i) for i in (1, 4, 26, 27, 30)] == ["A", "D", "Z", "AA", "AD"]
     assert sync.sheet_serial(dt.datetime(1899, 12, 31, 12, 0)) == 1.5
+
+
+def test_guard_never_lowers_gains_and_fills_missing():
+    high = {}
+    assert sync.guard("Alice", [100, 5], high) == [100, 5]
+    assert sync.guard("alice", [90, None], high) == [100, 5]     # lower / missing -> keep best
+    assert sync.guard("Alice", [150, 6], high) == [150, 6]       # growth passes through
+    assert sync.guard("Bob", [0, 0], high) == [0, 0]             # per player, not per row
+
+
+def test_guard_applied_in_sync_and_shared_across_sheets():
+    high = {}
+    ws1 = FakeWS(["agility"], ["Alice"])
+    sync.sync_sheet(FakeGC(ws1), "s1", FakeWom({"alice": gained((0, 500))}), {}, WINDOW, DURING, high)
+    ws2 = FakeWS(["agility"], ["Bob", "Alice"])
+    sync.sync_sheet(FakeGC(ws2), "s2", FakeWom({"alice": gained((0, 300)), "bob": gained((0, 7))}),
+                    {}, WINDOW, DURING, high)
+    assert vals(ws2, "D7")[:2] == [[7], [500]]
